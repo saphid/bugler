@@ -1,0 +1,20 @@
+name = "bugler"
+main = "src/workers/index.ts"
+compatibility_date = "2026-08-22"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+BUGLER_LEGACY_DO = "1"
+
+[[durable_objects.bindings]]
+name = "BUGLER"
+class_name = "BuglerDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ReveilleDurableObject"]
+
+[[migrations]]
+tag = "v2"
+renamed_classes = [{ from = "ReveilleDurableObject", to = "BuglerDurableObject" }]
