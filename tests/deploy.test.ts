@@ -48,6 +48,45 @@ describe("deployment setup dry runs", () => {
     expect(result.stdout).toContain("Tailscale Funnel");
   });
 
+  it("prints the Firestore Cloud Run scale-to-zero plan and requires consent for mutation", async () => {
+    const dry = await run("deploy/gcp/setup-cloudrun.sh", ["--project", "dry-run-project", "--dry-run"]);
+    expect(dry.exitCode).toBe(0);
+    expect(dry.stdout).toContain("enable run.googleapis.com firestore.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com");
+    expect(dry.stdout).toContain("Firestore Native database (default)");
+    expect(dry.stdout).toContain("source/subject/seq and source/type/seq composite indexes");
+    expect(dry.stdout).toContain("gcloud builds submit");
+    expect(dry.stdout).toContain("BUGLER_STORAGE=firestore");
+    expect(dry.stdout).toContain("min instances 0");
+    expect(dry.stdout).toContain("cold start beyond GitHub's 10 second response deadline");
+    expect(dry.stdout).toContain("cannot originate poll or retention work");
+    expect(dry.stdout).not.toMatch(/bgl_adm_[A-Za-z0-9_-]+/);
+
+    const refused = await run("deploy/gcp/setup-cloudrun.sh", ["--project", "dry-run-project"]);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain("--yes is required");
+  });
+
+  it("rejects Cloud Run values that would corrupt the deployment environment", async () => {
+    const badNamespace = await run("deploy/gcp/setup-cloudrun.sh", ["--project", "dry-run-project", "--namespace", "a,b", "--dry-run"]);
+    expect(badNamespace.exitCode).toBe(2);
+    expect(badNamespace.stderr).toContain("--namespace must not");
+
+    const badDatabase = await run("deploy/gcp/setup-cloudrun.sh", ["--project", "dry-run-project", "--database", "prod=x", "--dry-run"]);
+    expect(badDatabase.exitCode).toBe(2);
+    expect(badDatabase.stderr).toContain("--database must not");
+  });
+
+  it("warns loudly when the service account name would truncate", async () => {
+    const longService = "aaaaaaaaaaaaaaaaaaaaaaaa-collides";
+    const dry = await run("deploy/gcp/setup-cloudrun.sh", ["--project", "dry-run-project", "--service", longService, "--dry-run"]);
+    expect(dry.exitCode).toBe(0);
+    expect(dry.stdout).toContain("WARNING: the service account id truncates --service");
+    expect(dry.stdout).toContain("Passing --yes acknowledges this");
+
+    const short = await run("deploy/gcp/setup-cloudrun.sh", ["--project", "dry-run-project", "--dry-run"]);
+    expect(short.stdout).not.toContain("WARNING: the service account id truncates");
+  });
+
   it("preserves the pre-rename Docker database before choosing the Bugler default", async () => {
     const entrypoint = await Bun.file(join(root, "deploy/docker/entrypoint.sh")).text();
     const legacyCheck = entrypoint.indexOf('[ -f /data/reveille.db ]');

@@ -11,6 +11,7 @@ export interface WorkersEnv {
   BUGLER: DurableObjectNamespace<BuglerDurableObject>;
   REVEILLE?: DurableObjectNamespace<BuglerDurableObject>;
   BUGLER_LEGACY_DO?: string;
+  BUGLER_TENANT_HOST_SUFFIX?: string;
   [name: string]: unknown;
 }
 
@@ -82,8 +83,34 @@ export default {
   fetch(request: Request, env: WorkersEnv): Promise<Response> {
     const namespace = env.BUGLER ?? env.REVEILLE;
     if (!namespace) throw new Error("BUGLER Durable Object binding is missing");
-    const instanceName = env.BUGLER_LEGACY_DO === "1" ? "reveille" : "bugler";
+    const routed = tenantRoute(request, env.BUGLER_TENANT_HOST_SUFFIX);
+    if (routed instanceof Response) return Promise.resolve(routed);
+    const instanceName = routed.tenant ?? (env.BUGLER_LEGACY_DO === "1" ? "reveille" : "bugler");
     const id = namespace.idFromName(instanceName);
-    return namespace.get(id).fetch(request);
+    return namespace.get(id).fetch(routed.request);
   },
 };
+
+function tenantRoute(request: Request, hostSuffix: string | undefined): { tenant?: string; request: Request } | Response {
+  const url = new URL(request.url);
+  const pathMatch = /^\/t\/([^/]+)(\/.*)?$/.exec(url.pathname);
+  let tenant: string | undefined;
+  if (pathMatch) {
+    tenant = decodeURIComponent(pathMatch[1]!);
+    url.pathname = pathMatch[2] || "/";
+  } else if (hostSuffix) {
+    const suffix = hostSuffix.toLowerCase().startsWith(".") ? hostSuffix.toLowerCase() : `.${hostSuffix.toLowerCase()}`;
+    const hostname = url.hostname.toLowerCase();
+    if (hostname.endsWith(suffix)) {
+      const prefix = hostname.slice(0, -suffix.length);
+      if (prefix && !prefix.includes(".")) tenant = prefix;
+    }
+  }
+  if (!tenant) return { request };
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,62})$/.test(tenant)) {
+    return Response.json({ error: "invalid tenant id" }, { status: 400 });
+  }
+  const headers = new Headers(request.headers);
+  headers.set("x-bugler-tenant-id", tenant);
+  return { tenant, request: new Request(url, { method: request.method, headers, body: request.body, redirect: request.redirect }) };
+}

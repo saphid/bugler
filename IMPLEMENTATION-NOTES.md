@@ -13,6 +13,7 @@ This document maps the public implementation and records the decisions that matt
 - `src/storage/durable-object.ts`: Durable Object SQLite migrations and storage contract implementation.
 - `src/storage/dynamodb.ts`: DynamoDB key layout, conditions, transactions, and received-time index.
 - `src/storage/cosmos.ts`: Cosmos DB documents, transactional batches, ETag fencing, and indexed queries.
+- `src/storage/firestore.ts`: Firestore transactions, composite query indexes, fenced state updates, and bounded retention pages.
 - `src/mapping.ts`, `src/verification.ts`, `src/filter.ts`: ingest mapping, verifier presets, and CloudEvents filters.
 - `src/auth.ts`, `src/secrets.ts`, `src/environment.ts`: show-once credentials, hashing, secret resolution, and environment compatibility.
 - `src/delivery.ts`, `src/push.ts`, `src/history.ts`: pull, SSE, signed push, gaps, cursor state, and filtered history.
@@ -33,7 +34,7 @@ This document maps the public implementation and records the decisions that matt
 
 Core code depends only on `StorageDriver`. SQL, key layouts, engine APIs, size accounting, and engine-specific limits stay inside `src/storage/`. Sequence high-water marks survive retention deletion, so sequence numbers are never reused and a gap acknowledgment can advance through a deleted tail.
 
-The shared suite defines sequence allocation, dedupe, cursor rejection precedence, lease fencing, transactional append pairs, retention pinning, size accounting, query shapes, boundary payloads, and concurrency behavior. A semantic storage change must update this suite and pass unchanged for memory, Bun SQLite, Durable Object SQLite, DynamoDB, and Cosmos DB.
+The shared suite defines sequence allocation, dedupe, cursor rejection precedence, lease fencing, transactional append pairs, retention pinning, size accounting, query shapes, boundary payloads, and concurrency behavior. A semantic storage change must update this suite and pass unchanged for memory, Bun SQLite, Durable Object SQLite, DynamoDB, Cosmos DB, and Firestore.
 
 Bun SQLite sets `auto_vacuum=INCREMENTAL` before first schema creation and asserts WAL, `synchronous=FULL`, and incremental auto-vacuum on every open. It refuses startup when those durability settings are unavailable.
 
@@ -43,7 +44,9 @@ The DynamoDB driver uses one table with `pk` and `sk`. Events use `pk=EVENT` wit
 
 The Cosmos driver keeps all records in the logical partition `partitionKey=relay`. IDs encode record kind and semantic key. Append batches contain the fenced sequence increment, event create, optional dedupe create, size increment, and optional poll-state replacement. Every per-operation result must succeed. Counter contention is retryable; only the operation that owns a lease or ETag fence can report fence loss. The exact serialized event item is measured before write so JSON escaping cannot bypass the payload limit.
 
-DynamoDB Local and the Cosmos Linux vNext emulator run the shared conformance cases. Cosmos emulator coverage includes its returned-207 batch-failure shape. The real service's documented first-failure top-level shape is covered by synthetic response tests because the emulator emits 207 only. Cosmos service integration outside the emulator remains an operator acceptance check.
+The Firestore driver stores each namespace under one root document with subcollections for semantic record kinds. A Firestore transaction reads and fences the sequence and size counters, deterministic hashed dedupe marker, event document, and optional poll state before writing. Subscription and poll lease operations use the same transaction retry boundary. Source-subject and source-type queries use the composite indexes declared in `firestore.indexes.json`; age retention pages through the single-field `receivedAt` index without scanning unrelated events. Retention deletes at most eight selected events per transaction so worst-case 1 MiB documents stay below Firestore's transaction request limit. Size accounting is the UTF-8 JSON length of semantic events. The declared payload cap reserves the measured document field envelope, document-name overhead, and 32 KiB beneath Firestore's 1 MiB document limit.
+
+DynamoDB Local, the Cosmos Linux vNext emulator, and the official Google Cloud Firestore emulator run the shared conformance cases. Cosmos emulator coverage includes its returned-207 batch-failure shape. The real service's documented first-failure top-level shape is covered by synthetic response tests because the emulator emits 207 only. Firestore's emulator does not enforce every production transaction and size limit, so the driver applies its conservative document limit before writes and real-service integration remains an operator acceptance check.
 
 ### Delivery and wake behavior
 
@@ -63,9 +66,13 @@ Standalone polling and in-process poll sources share `PollEngine`. The standalon
 
 The Workers profile caps ingest and poll bodies at 1.5 MB, advertises a preferred 240 second wait, and defaults retention scheduling to 30 minutes. Workers secrets resolve through encrypted `env:` bindings. Local `file:` references are intentionally unavailable in that runtime.
 
+Hosted deployments route an optional tenant path or host to one named Durable Object per tenant. The default route remains the unchanged single-tenant self-hosted relay. Hosted policy is injected through runtime callbacks for metering and tier configuration, while the relay continues to depend only on the storage and delivery interfaces. The closed control-plane implementation is deliberately excluded from public exports.
+
+The hosted outer Worker authenticates and admission-controls subscriber polls before tenant-object execution. Hosted custom domains belong only to the closed platform Worker; the public relay configuration intentionally claims none of them. This preserves self-hosted behavior while preventing a deployment route from bypassing hosted metering or guardrails.
+
 Cloud storage may bootstrap with a checksummed `BUGLER_BOOTSTRAP_ADMIN_TOKEN`; only its hash is persisted. The container entry point initializes a local database only for SQLite, avoiding independent key creation by scaled cloud revisions.
 
-AWS setup provisions DynamoDB and a table-scoped IAM identity only. Compute is operator supplied because the complete long-polling relay has no honest always-free AWS host. Azure setup makes the operator choose scale-to-zero or an always-on minimum, provisions Cosmos free tier and Container Apps, and passes secrets through Key Vault references.
+AWS setup provisions DynamoDB and a table-scoped IAM identity only. Compute is operator supplied because the complete long-polling relay has no honest always-free AWS host. Azure setup makes the operator choose scale-to-zero or an always-on minimum, provisions Cosmos free tier and Container Apps, and passes secrets through Key Vault references. GCP setup offers either the SQLite VM or Firestore-backed Cloud Run with zero minimum instances. The Cloud Run recipe prints that cold starts can miss webhook deadlines and that scheduled work cannot originate while no instance exists.
 
 ### Upgrade continuity
 
@@ -87,6 +94,5 @@ No other intentional design deviations are known.
 
 ## Future driver notes
 
-- Firestore should allocate sequence and append within transactions, use composite indexes for source-subject and source-type queries, and document its size approximation and retention query bounds.
 - Postgres should use an identity sequence that is never reset, transactional dedupe return, conditional epoch-aware cursor updates, and database-size measurement. Notifications may only nudge readers; stored rows remain truth.
 - Any new driver must declare a conservative payload boundary, measure the exact representation it writes, implement bounded receive-time retention queries, distinguish retryable engine contention from semantic fence loss, and pass the shared conformance suite unchanged.

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Public export exclusions:
 # CHARTER.md, KICKOFF.md, PLAN.md, STATUS.md, design/, research/, reviews/,
-# verification/, orchestration/, prompts/, and site/drafts/. site/index.html is kept.
+# verification/, orchestration/, prompts/, platform/, and site/drafts/. site/index.html is kept.
 
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DESTINATION=${BUGLER_EXPORT_DIR:-/tmp/bugler-public}
@@ -33,11 +33,12 @@ rm -rf \
   "$STAGING/verification" \
   "$STAGING/orchestration" \
   "$STAGING/prompts" \
+  "$STAGING/platform" \
   "$STAGING/site/drafts"
 
 INTERNAL_PATHS=(
   CHARTER.md KICKOFF.md PLAN.md STATUS.md design research reviews verification
-  orchestration prompts site/drafts
+  orchestration prompts platform site/drafts
 )
 for path in "${INTERNAL_PATHS[@]}"; do
   if [[ -e "$STAGING/$path" ]]; then

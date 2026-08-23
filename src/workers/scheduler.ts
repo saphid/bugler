@@ -24,6 +24,8 @@ export interface WorkersSchedulerOptions {
   maxSlice?: number;
   onEvent?: () => void;
   pushFetch?: PushEngineOptions["fetch"];
+  onPushDelivered?: PushEngineOptions["onDelivered"];
+  retentionPolicy?: () => Promise<{ maxAgeMs?: number; maxCount?: number; maxBytes?: number; pinningWindowMs?: number }>;
 }
 
 type DueWork =
@@ -70,6 +72,7 @@ export class WorkersDueWorkScheduler {
   private readonly poll: PollEngine;
   private readonly push: PushEngine;
   private readonly reconcile: GitHubReconciler;
+  private readonly retentionPolicy: WorkersSchedulerOptions["retentionPolicy"];
   private sourceSchedules: Map<string, SourceSchedule> | undefined;
   private pushSchedules: Map<string, PushSchedule> | undefined;
 
@@ -88,10 +91,12 @@ export class WorkersDueWorkScheduler {
     this.pinningWindowMs = options.pinningWindowMs ?? this.retentionMaxAgeMs;
     this.maxSlice = Math.max(1, Math.min(6, Math.trunc(options.maxSlice ?? 6)));
     this.onEvent = options.onEvent;
+    this.retentionPolicy = options.retentionPolicy;
     this.poll = new PollEngine(driver, { now: this.now, maxPayloadBytes: 1_500_000 });
     this.push = new PushEngine(driver, secrets, {
       now: this.now,
       ...(options.pushFetch ? { fetch: options.pushFetch } : {}),
+      ...(options.onPushDelivered ? { onDelivered: options.onPushDelivered } : {}),
     });
     this.reconcile = new GitHubReconciler(driver, secrets, fetch, this.now);
   }
@@ -210,11 +215,12 @@ export class WorkersDueWorkScheduler {
       if (source) await this.reconcile.run(source);
       return;
     }
+    const override = await this.retentionPolicy?.() ?? {};
     const result = await this.driver.enforceRetention({
-      maxAgeMs: this.retentionMaxAgeMs,
-      maxCount: this.retentionMaxCount,
-      maxBytes: this.retentionMaxBytes,
-      pinningWindowMs: this.pinningWindowMs,
+      maxAgeMs: override.maxAgeMs ?? this.retentionMaxAgeMs,
+      maxCount: override.maxCount ?? this.retentionMaxCount,
+      maxBytes: override.maxBytes ?? this.retentionMaxBytes,
+      pinningWindowMs: override.pinningWindowMs ?? this.pinningWindowMs,
     }, this.now().toISOString());
     this.health.retentionPressure = result.sizeOverride;
     await this.alarmStorage.put(RETENTION_DUE_KEY, this.now().getTime() + this.retentionEveryMs);

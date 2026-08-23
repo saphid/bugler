@@ -19,6 +19,38 @@ async function withDriver<T>(operation: (instance: BuglerDurableObject, state: D
 }
 
 describe("Workers profile", () => {
+  it("isolates path-prefixed and subdomain tenant routes while preserving the default relay", async () => {
+    const alpha = env.BUGLER.get(env.BUGLER.idFromName("alpha"));
+    const beta = env.BUGLER.get(env.BUGLER.idFromName("beta"));
+    await runInDurableObject(alpha, async (instance: BuglerDurableObject) => {
+      await instance.driver.appendEvent(conformanceEvent("alpha-event", "alpha-event"));
+    });
+    await runInDurableObject(beta, async (instance: BuglerDurableObject) => {
+      await instance.driver.appendEvent(conformanceEvent("beta-event-1", "beta-event-1"));
+      await instance.driver.appendEvent(conformanceEvent("beta-event-2", "beta-event-2"));
+    });
+
+    const alphaResponse = await worker.fetch(new Request("https://relay.example/t/alpha/healthz"), {
+      BUGLER: env.BUGLER,
+    });
+    expect(alphaResponse.status).toBe(200);
+    expect(await alphaResponse.json()).toMatchObject({ newest_seq: 1 });
+
+    const betaResponse = await worker.fetch(new Request("https://beta.relay.example/healthz"), {
+      BUGLER: env.BUGLER,
+      BUGLER_TENANT_HOST_SUFFIX: ".relay.example",
+    });
+    expect(betaResponse.status).toBe(200);
+    expect(await betaResponse.json()).toMatchObject({ newest_seq: 2 });
+
+    const defaultResponse = await worker.fetch(new Request("https://relay.example/healthz"), {
+      BUGLER: env.BUGLER,
+      BUGLER_LEGACY_DO: "1",
+    });
+    expect(defaultResponse.status).toBe(200);
+    expect(await defaultResponse.json()).toMatchObject({ newest_seq: 0 });
+  });
+
   it("routes compatibility deployments to the legacy named Durable Object", async () => {
     const legacy = env.BUGLER.get(env.BUGLER.idFromName("reveille"));
     await runInDurableObject(legacy, async (instance: BuglerDurableObject) => {

@@ -90,6 +90,7 @@ export interface PushEngineOptions {
   now?: () => Date;
   timeoutMs?: number;
   leaseMs?: number;
+  onDelivered?: (subscriptionId: string, seq: number, at: string) => Promise<void>;
 }
 
 export class PushEngine {
@@ -97,6 +98,7 @@ export class PushEngine {
   private readonly now: () => Date;
   private readonly timeoutMs: number;
   private readonly leaseMs: number;
+  private readonly onDelivered: PushEngineOptions["onDelivered"];
 
   constructor(
     private readonly driver: StorageDriver,
@@ -107,6 +109,7 @@ export class PushEngine {
     this.now = options.now ?? (() => new Date());
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.leaseMs = options.leaseMs ?? 60_000;
+    this.onDelivered = options.onDelivered;
   }
 
   private clearLease(subscription: Subscription): void {
@@ -203,6 +206,9 @@ export class PushEngine {
         ...(gapTo === undefined ? { cursor: (delivery as StoredEvent).seq } : {}),
         lastSeenAt: subscription.lastSeenAt,
       });
+      if (committed.status === "committed" && gapTo === undefined && this.onDelivered) {
+        await this.onDelivered(subscriptionId, (delivery as StoredEvent).seq, now.toISOString());
+      }
       return committed.status === "committed" ? { status: gapTo === undefined ? "success" : "gap_parked" } : { status: "busy" };
     } catch (error) {
       const message = asErrorMessage(error);

@@ -50,12 +50,14 @@ For one compatibility release, `REVEILLE_*` inputs are deprecated aliases and ch
 
 ## Hosted (early access)
 
-The hosted control plane is coming. Intended flow:
+The hosted control plane is available to early-access accounts at `https://app.bugler.dev`. Flow:
 
 1. Sign in with Clerk at the hosted Bugler control plane.
-2. Create or select a relay.
-3. Create, rotate, revoke, and label API keys through self-service.
+2. The first authenticated request provisions an isolated relay automatically.
+3. Mint a show-once platform API key through `POST /api/platform-keys` for agent automation.
 4. Copy each show-once key into the human's secret manager or the agent runtime's environment.
 5. Use the same bearer-token and cursor-epoch contracts as self-hosted Bugler.
 
 Hosted access does not change the relay's payload trust model. Events remain untrusted data.
+
+The exact hosted curl sequence is served as machine-readable Markdown at `https://app.bugler.dev/auth.md` and `https://bugler.dev/auth.md`.

@@ -10,6 +10,7 @@ import { EnvironmentFileSecretResolver } from "./secrets";
 import { createCosmosContainer, CosmosStorageDriver } from "./storage/cosmos";
 import { DynamoDbStorageDriver, requireDynamoDbTable } from "./storage/dynamodb";
 import type { StorageDriver } from "./storage/driver";
+import { FirestoreStorageDriver } from "./storage/firestore";
 import { SqliteStorageDriver } from "./storage/sqlite";
 import { DynamoDBClient, type DynamoDBClientConfig } from "@aws-sdk/client-dynamodb";
 import { newUlid, parseDurationSeconds } from "./util";
@@ -88,6 +89,14 @@ async function storageDriver(args: Arguments): Promise<StorageDriver> {
       containerId: productEnvironment("COSMOS_CONTAINER") ?? "relay",
     });
     return new CosmosStorageDriver({ container, client });
+  }
+  if (name === "firestore") {
+    const projectId = productEnvironment("FIRESTORE_PROJECT");
+    return new FirestoreStorageDriver({
+      ...(projectId ? { projectId } : {}),
+      databaseId: productEnvironment("FIRESTORE_DATABASE") ?? "(default)",
+      namespace: productEnvironment("FIRESTORE_NAMESPACE") ?? "bugler",
+    });
   }
   throw new Error(`unsupported BUGLER_STORAGE ${name}`);
 }

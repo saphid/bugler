@@ -42,6 +42,10 @@ export interface CreateAppOptions {
   health?: RelayHealth;
   pushEngine?: PushEngine;
   sseMaxLifetimeMs?: number;
+  onEventsDelivered?: (subscriptionId: string, seqs: number[], at: string) => Promise<void>;
+  onSubscriberAuthChanged?: (subscription: Subscription) => Promise<void>;
+  onSubscriberDeleted?: (subscriptionId: string) => Promise<void>;
+  onEventCommitted?: (sourceId: string, seq: number) => Promise<void>;
 }
 
 function publicSubscription(subscription: Subscription): Omit<Subscription, "tokenHash" | "oldTokenHash"> {
@@ -236,6 +240,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     }
     const committed = await driver.appendEvent(mapped);
     delivery.notifyNewEvent();
+    if (options.onEventCommitted) await options.onEventCommitted(source.id, committed.event.seq);
     return context.json({ accepted: true, inserted: committed.inserted, seq: committed.event.seq, id: committed.event.id }, 200);
   });
 
@@ -337,6 +342,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
         lastSeenAt: now().toISOString(),
       };
       await driver.putSubscription(subscription);
+      if (options.onSubscriberAuthChanged) await options.onSubscriberAuthChanged(subscription);
       return context.json({ subscription: publicSubscription(subscription), token: minted.token }, 201);
     } catch (error) {
       return context.json({ error: asErrorMessage(error) }, 422);
@@ -384,7 +390,10 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
   });
   app.delete("/subscriptions/:id", async (context) => {
     if (!(await requireAdmin(context))) return context.json({ error: "unauthorized" }, 401);
-    return (await driver.deleteSubscription(context.req.param("id"))) ? context.body(null, 204) : context.json({ error: "not found" }, 404);
+    const id = context.req.param("id");
+    if (!(await driver.deleteSubscription(id))) return context.json({ error: "not found" }, 404);
+    if (options.onSubscriberDeleted) await options.onSubscriberDeleted(id);
+    return context.body(null, 204);
   });
 
   app.post("/subscriptions/:id/token/rotate", async (context) => {
@@ -400,6 +409,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     subscription.tokenPrefix = minted.prefix;
     subscription.tokenRevoked = false;
     await driver.updateSubscription(subscription);
+    if (options.onSubscriberAuthChanged) await options.onSubscriberAuthChanged(subscription);
     return context.json({ token: minted.token, old_token_expires_at: subscription.oldTokenExpiresAt });
   });
   app.delete("/subscriptions/:id/token", async (context) => {
@@ -410,6 +420,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     delete subscription.oldTokenHash;
     delete subscription.oldTokenExpiresAt;
     await driver.updateSubscription(subscription);
+    if (options.onSubscriberAuthChanged) await options.onSubscriberAuthChanged(subscription);
     return context.body(null, 204);
   });
 
@@ -422,12 +433,16 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     const ack = typeof body.ack === "number" ? body.ack : undefined;
     const ackEpoch = typeof body.ack_epoch === "number" ? body.ack_epoch : undefined;
     const limit = typeof body.limit === "number" ? body.limit : undefined;
-    return context.json(await delivery.poll(context.req.param("id"), {
+    const payload = await delivery.poll(context.req.param("id"), {
       ...(wait !== undefined ? { wait } : {}),
       ...(ack !== undefined ? { ack } : {}),
       ...(ackEpoch !== undefined ? { ack_epoch: ackEpoch } : {}),
       ...(limit !== undefined ? { limit } : {}),
-    }));
+    });
+    if ("events" in payload && payload.events.length > 0 && options.onEventsDelivered) {
+      await options.onEventsDelivered(context.req.param("id"), payload.events.map((event) => event.seq), now().toISOString());
+    }
+    return context.json(payload);
   });
 
   app.get("/subscriptions/:id/stream", async (context) => {
@@ -461,6 +476,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
         } else if (payload.events.length > 0) {
           gapSentTo = undefined;
           for (const event of payload.events) {
+            if (options.onEventsDelivered) await options.onEventsDelivered(id, [event.seq], now().toISOString());
             await stream.writeSSE({ event: "event", id: String(event.seq), data: JSON.stringify(event) });
             afterSeq = event.seq;
           }

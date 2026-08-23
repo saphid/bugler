@@ -99,6 +99,12 @@ Run the complete local flow with a real-shaped signed GitHub review payload:
 bun run smoke
 ```
 
+## Hosted early access
+
+The hosted control plane at [app.bugler.dev](https://app.bugler.dev) provisions an isolated relay after Clerk sign-in. It reveals the bootstrap admin token once, provides a preset-driven source wizard, reveals subscriber tokens once, tails recent history, and shows monthly usage. Agents can mint a hashed-at-rest platform API key and use the same control-plane operations without a browser. Machine-readable setup commands are available at `https://bugler.dev/auth.md` and `https://app.bugler.dev/auth.md`.
+
+Hosted tenant state is isolated by one Durable Object per tenant. The public relay remains storage-neutral and single-tenant by default. Hosted routing and policy are an optional layer and do not change self-hosted paths or delivery semantics.
+
 ## Wake a stopped agent with `listen`
 
 `listen` keeps no local state. It long-polls the relay, sends one complete envelope to the command on stdin, and advances the relay cursor only after that command exits zero. A crash or nonzero exit leaves the cursor unchanged, so the event is delivered again. Subscriber tokens come only from `BUGLER_TOKEN`, or from the environment variable named by `--token-env`. The resolved token variable is removed from the handler environment. If a handler needs its own relay token, the operator must pass it explicitly under a separate handler-specific variable.
@@ -201,7 +207,7 @@ For a generic standalone poll target, configure relay mapping with a static sour
 | Durable Object SQLite | Cloudflare Workers | One named SQLite Durable Object, synchronous transactions, indexed query shapes, and `databaseSize` measurement | 1.5 MB |
 | DynamoDB | AWS | Atomic counter, conditional writes, transactional append pairs, materialized source query keys, and one receive-time GSI | 392,546 bytes |
 | Cosmos DB NoSQL | Azure | One logical partition, transactional batches, deterministic conflict keys, ETag CAS, and indexed query shapes | 2,063,812 bytes |
-| Firestore | GCP serverless follow-up | Transactions and target-specific indexes | Driver-declared |
+| Firestore | GCP Cloud Run | Transactional sequence, append, dedupe, and fencing; composite source query indexes; bounded receive-time retention queries | 1,014,804 bytes |
 | Bring-your-own Postgres | Teams with an existing database | Identity sequence, conditional cursor update, per-driver migrations | Driver-declared |
 
 No SQL or storage-engine behavior is visible outside `src/storage`. The shared conformance suite defines correctness for every driver.
@@ -288,15 +294,27 @@ The script provisions the lifetime free-tier Cosmos account at shared 1000 RU/s,
 
 The Cosmos driver is verified under Microsoft's Linux vNext emulator on ARM64. All relay records share one logical partition at Bugler's intended volume, allowing the sequence counter, event create, dedupe marker, size counter, and poll advance to commit atomically. The `serve` and `init` commands select it with `BUGLER_STORAGE=cosmos`; the Azure script supplies the remaining endpoint, key, database, and container settings.
 
-### GCP always-free VM
+### GCP Cloud Run and VM
 
-Preview the blessed SQLite VM profile:
+Preview the Firestore-backed Cloud Run scale-to-zero profile:
+
+```bash
+bash deploy/gcp/setup-cloudrun.sh --project YOUR_PROJECT --dry-run
+```
+
+After reviewing the plan, run it with `--yes`. The script enables the required APIs, creates a Firestore Native database and the two composite event indexes, stores the bootstrap admin token in Secret Manager, builds and pushes the Docker image through Cloud Build and Artifact Registry, and deploys `BUGLER_STORAGE=firestore` with a dedicated `roles/datastore.user` service identity. Re-runs reuse the database, indexes, service identity, registry, and enabled secret version.
+
+Cloud Run uses zero minimum instances and one maximum instance. This can be exactly idle when unused, but a cold start can exceed GitHub's 10 second response deadline and GitHub does not automatically retry a failed delivery. While no instance exists, Bugler also cannot originate scheduled poll or retention work. An inbound webhook, pull, or health request must start an instance first. Keep one active listener or use the VM profile when timely webhook admission and autonomous schedules matter.
+
+The Firestore driver keeps the sequence counter, event, deterministic dedupe marker, semantic size counter, and optional poll state in one transaction. Cursor and push/poll lease updates are transactionally fenced. Receive-time retention walks the `receivedAt` index in bounded pages, and source-subject plus source-type history uses the declared composite indexes in `firestore.indexes.json`. The size result is a transactionally maintained UTF-8 JSON event-byte approximation, not Firestore billing usage.
+
+Preview the SQLite VM profile:
 
 ```bash
 bash deploy/gcp/setup-vm.sh --project YOUR_PROJECT --dry-run
 ```
 
-The real command requires an already linked billing account, enables only the Compute Engine API, cross-compiles the Linux x64 binary, and creates or reuses one `e2-micro` with a 30 GB standard disk in an eligible free-tier region. It installs Bugler under systemd and prints Cloudflare Tunnel, Tailscale Funnel, and firewall guidance. It never changes billing settings. See [deploy/gcp/README.md](deploy/gcp/README.md) for the external IPv4 cost caveat and why Cloud Run waits for the Firestore driver.
+The real command requires an already linked billing account, enables only the Compute Engine API, cross-compiles the Linux x64 binary, and creates or reuses one `e2-micro` with a 30 GB standard disk in an eligible free-tier region. It installs Bugler under systemd and prints Cloudflare Tunnel, Tailscale Funnel, and firewall guidance. It never changes billing settings. See [deploy/gcp/README.md](deploy/gcp/README.md) for the Cloud Run tradeoffs and external IPv4 cost caveat.
 
 ### GitHub repository webhook
 

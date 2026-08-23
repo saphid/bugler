@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
@@ -12,16 +12,20 @@ describe("public repository export", () => {
     expect(openapi).toContain(`version: "${packageJson.version}"`);
   });
 
-  it("documents only authentication endpoints implemented by the Hono app", async () => {
+  it("documents only authentication endpoints implemented by the relay or hosted app", async () => {
     const root = join(import.meta.dir, "..");
     const auth = await readFile(join(root, "AUTH.md"), "utf8");
     const app = await readFile(join(root, "src/app.ts"), "utf8");
+    const platformPath = join(root, "platform/index.ts");
+    const platform = await Bun.file(platformPath).exists() ? await readFile(platformPath, "utf8") : "";
     const endpoints = [...auth.matchAll(/`(GET|POST|PATCH|DELETE) (\/[^`]+)`/g)];
     expect(endpoints.length).toBeGreaterThan(0);
     for (const endpoint of endpoints) {
       const method = endpoint[1]!.toLowerCase();
       const route = endpoint[2]!.replaceAll("{id}", ":id");
-      expect(app, `${endpoint[1]} ${endpoint[2]}`).toContain(`app.${method}("${route}"`);
+      const implementation = route.startsWith("/api/") ? platform : app;
+      if (!implementation && route.startsWith("/api/")) continue;
+      expect(implementation, `${endpoint[1]} ${endpoint[2]}`).toContain(`app.${method}("${route}"`);
     }
   });
 
@@ -50,6 +54,48 @@ describe("public repository export", () => {
       const log = Bun.spawnSync(["git", "log", "--format=%s"], { cwd: destination });
       expect(log.stdout.toString().trim()).toBe("Bugler v0.1.0");
       expect((await readFile(join(destination, "package.json"), "utf8"))).toContain('"name": "bugler"');
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes the closed hosted platform tree", async () => {
+    const root = join(import.meta.dir, "..");
+    const parent = await mkdtemp(join(tmpdir(), "bugler-public-platform-test-"));
+    const clone = join(parent, "source");
+    const destination = join(parent, "bugler-public-output");
+    try {
+      const cloned = Bun.spawnSync(["git", "clone", "--quiet", "--local", "--no-hardlinks", root, clone]);
+      expect(cloned.exitCode, cloned.stderr.toString()).toBe(0);
+      await copyFile(join(root, "scripts/export-public.sh"), join(clone, "scripts/export-public.sh"));
+      await mkdir(join(clone, "platform"), { recursive: true });
+      await writeFile(join(clone, "platform", "private.txt"), "closed hosted control plane\n");
+      const staged = Bun.spawnSync(["git", "add", "scripts/export-public.sh", "platform/private.txt"], { cwd: clone });
+      expect(staged.exitCode, staged.stderr.toString()).toBe(0);
+      const committed = Bun.spawnSync(["git", "commit", "-q", "-m", "plant platform probe"], {
+        cwd: clone,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Probe",
+          GIT_AUTHOR_EMAIL: "probe@example.invalid",
+          GIT_COMMITTER_NAME: "Probe",
+          GIT_COMMITTER_EMAIL: "probe@example.invalid",
+        },
+      });
+      expect(committed.exitCode, committed.stderr.toString()).toBe(0);
+
+      const child = Bun.spawn(["bash", "scripts/export-public.sh"], {
+        cwd: clone,
+        env: { ...process.env, BUGLER_EXPORT_DIR: destination },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stderr).text(),
+      ]);
+      expect(exitCode, stderr).toBe(0);
+      expect(await Bun.file(join(destination, "platform", "private.txt")).exists()).toBe(false);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
