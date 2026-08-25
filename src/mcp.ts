@@ -10,9 +10,10 @@ interface RelayBatch {
 }
 
 export interface BuglerMcpOptions {
-  relay: string;
+  relay?: string;
   subscriptionId: string;
   token: string;
+  eventsEndpoint?: string;
   fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   now?: () => number;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
@@ -25,6 +26,8 @@ class RelayRateLimitError extends Error {
 }
 
 function eventsUrl(options: BuglerMcpOptions): string {
+  if (options.eventsEndpoint) return options.eventsEndpoint;
+  if (!options.relay) throw new Error("relay or eventsEndpoint is required");
   return `${options.relay.replace(/\/$/, "")}/subscriptions/${encodeURIComponent(options.subscriptionId)}/events`;
 }
 

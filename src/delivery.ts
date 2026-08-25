@@ -2,6 +2,9 @@ import type { StoredEvent, Subscription } from "./domain";
 import { matchesFilter } from "./filter";
 import type { StorageDriver } from "./storage/driver";
 
+/** Hosted callers must choose explicitly. Direct seam omission is fail-closed; self-hosted routes pass allow. */
+export type EventEntitlement = Subscription["filter"] | "allow" | "deny";
+
 export interface DeliveryProfile {
   defaultWaitSeconds: number;
   minWaitSeconds: number;
@@ -117,7 +120,7 @@ export class DeliveryCoordinator {
     }
   }
 
-  private async read(subscription: Subscription, limit: number, afterSeq = subscription.cursor): Promise<DeliveryPayload> {
+  private async read(subscription: Subscription, limit: number, afterSeq = subscription.cursor, entitlement: EventEntitlement = "deny"): Promise<DeliveryPayload> {
     const oldest = await this.driver.oldestAvailableSeq();
     if (oldest > subscription.cursor + 1) {
       return {
@@ -126,11 +129,15 @@ export class DeliveryCoordinator {
         oldest_available_seq: oldest,
       };
     }
+    if (entitlement === "deny") {
+      return { events: [], cursor_epoch: subscription.cursorEpoch, oldest_available_seq: oldest };
+    }
     const events: StoredEvent[] = [];
     let scanCursor = Math.max(subscription.cursor, afterSeq);
     for (let page = 0; page < 100 && events.length < limit; page += 1) {
       const scanned = await this.driver.queryEvents({ sinceSeq: scanCursor, limit: this.profile.scanLimit });
-      events.push(...scanned.filter((event) => matchesFilter(event, subscription.filter)).slice(0, limit - events.length));
+      events.push(...scanned.filter((event) => matchesFilter(event, subscription.filter)
+        && (entitlement === "allow" || matchesFilter(event, entitlement))).slice(0, limit - events.length));
       if (scanned.length < this.profile.scanLimit) break;
       scanCursor = scanned[scanned.length - 1]!.seq;
     }
@@ -183,6 +190,7 @@ export class DeliveryCoordinator {
   async poll(
     subscriptionId: string,
     body: { wait?: number; ack?: number; ack_epoch?: number; limit?: number },
+    entitlement: EventEntitlement = "deny",
   ): Promise<DeliveryPayload> {
     const prepared = await this.serialized(subscriptionId, async () => {
       let subscription = await this.driver.getSubscription(subscriptionId);
@@ -197,7 +205,7 @@ export class DeliveryCoordinator {
       }
       await this.driver.refreshLiveness(subscriptionId, this.now().toISOString(), 60 * 60 * 1000);
       const limit = Math.max(1, Math.min(Math.trunc(body.limit ?? this.profile.maxBatch), this.profile.maxBatch));
-      return { subscription, limit, payload: await this.read(subscription, limit) };
+      return { subscription, limit, payload: await this.read(subscription, limit, subscription.cursor, entitlement) };
     });
     let { subscription, limit, payload } = prepared;
     this.supersedeParked(subscriptionId);
@@ -213,17 +221,17 @@ export class DeliveryCoordinator {
       const refreshed = await this.driver.getSubscription(subscriptionId);
       if (!refreshed) throw new DeliveryError("not_found", 404);
       subscription = refreshed;
-      payload = await this.read(subscription, limit);
+      payload = await this.read(subscription, limit, subscription.cursor, entitlement);
       return this.hasDelivery(payload) ? payload : { ...payload, retry_after: admission.retryAfter };
     });
   }
 
-  async readForSse(subscriptionId: string, afterSeq?: number, limit = 100): Promise<DeliveryPayload> {
+  async readForSse(subscriptionId: string, afterSeq?: number, limit = 100, entitlement: EventEntitlement = "deny"): Promise<DeliveryPayload> {
     return this.serialized(subscriptionId, async () => {
       const subscription = await this.driver.getSubscription(subscriptionId);
       if (!subscription) throw new DeliveryError("not_found", 404);
       await this.driver.refreshLiveness(subscriptionId, this.now().toISOString(), 60 * 60 * 1000);
-      return this.read(subscription, Math.min(limit, this.profile.maxBatch), afterSeq ?? subscription.cursor);
+      return this.read(subscription, Math.min(limit, this.profile.maxBatch), afterSeq ?? subscription.cursor, entitlement);
     });
   }
 }

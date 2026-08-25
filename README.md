@@ -53,6 +53,26 @@ curl -X POST http://127.0.0.1:8787/subscriptions \
   }'
 ```
 
+For a provider without a preset, `mapping.source` is the CloudEvents source string while every other mapped attribute is an object selecting `static`, `header`, `json_pointer`, or `template`. This complete generic-token example maps an event type from a constant, a subject from JSON, and a dedupe key from a header:
+
+```bash
+export CUSTOM_WEBHOOK_TOKEN='replace-me'
+curl -X POST http://127.0.0.1:8787/sources \
+  -H "Authorization: Bearer $BUGLER_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id":"custom-alerts",
+    "kind":"http",
+    "verification":{"preset":"generic-token","secret_refs":["env:CUSTOM_WEBHOOK_TOKEN"]},
+    "mapping":{
+      "source":"custom/acme-alerts",
+      "type":{"static":"com.acme.alert"},
+      "subject":{"json_pointer":"/service/name"},
+      "dedupekey":{"header":"x-event-id"}
+    }
+  }'
+```
+
 Send a signed sample event so the delivery commands have one sequence to process:
 
 ```bash
@@ -101,9 +121,11 @@ bun run smoke
 
 ## Hosted early access
 
-The hosted control plane at [app.bugler.dev](https://app.bugler.dev) provisions an isolated relay after Clerk sign-in. It reveals the bootstrap admin token once, provides a preset-driven source wizard, reveals subscriber tokens once, tails recent history, and shows monthly usage. Agents can mint a hashed-at-rest platform API key and use the same control-plane operations without a browser. Machine-readable setup commands are available at `https://bugler.dev/auth.md` and `https://app.bugler.dev/auth.md`.
+The hosted control plane at [app.bugler.dev](https://app.bugler.dev) provisions an isolated relay after Clerk sign-in. Select **Add GitHub**, choose the organization and repositories on GitHub, and approve the App. On first setup, the callback creates the tenant's GitHub App source, monitored-repository set, and starter subscription, links the installing member for repository entitlements, and reveals the subscriber token once. Repeating the flow preserves the existing starter token, cursor, epoch, and principal. Stripe, Sentry, GitLab, and CircleCI remain available in the same source wizard as paste-one-URL presets. The dashboard also tails recent history and shows monthly usage. Agents can mint a hashed-at-rest platform API key and use the same control-plane operations without a browser. Machine-readable setup commands are available at `https://bugler.dev/auth.md` and `https://app.bugler.dev/auth.md`.
 
 Hosted tenant state is isolated by one Durable Object per tenant. The public relay remains storage-neutral and single-tenant by default. Hosted routing and policy are an optional layer and do not change self-hosted paths or delivery semantics.
+
+Hosted Clerk organizations map one-to-one to tenants with owner, admin, and member roles. Enterprise SAML and OIDC connections are configured in Clerk. Members can link GitHub through the GitHub App authorization flow; Bugler mirrors their user-scoped installation repositories and intersects that entitlement with every subscription or history filter. Sources without an upstream resolver default to no member visibility until an owner or admin creates a grant. Service principals also require explicit grants. See [AUTH.md](AUTH.md) for exact commands.
 
 ## Wake a stopped agent with `listen`
 
@@ -173,6 +195,93 @@ tool_timeout_sec = 60
 ```
 
 `wait_for_event` defaults to 45 seconds and hard-clamps every call to 50 seconds. `check_events` never parks. Near-real-time in-session waiting also depends on the relay deployment profile's admission cadence. Binary and VM profiles support short admitted waits. Workers profiles favor relaunch through `listen` or signed push.
+
+## Durable local daemon
+
+The daemon mirrors hosted subscriptions into a local SQLite store, then gives each local agent an independent cursor. One daemon serves exactly one Bugler origin, tenant, and hosted principal. Run another named account for another principal or tenant.
+
+Create a narrowly scoped daemon credential in the hosted API. The credential can mint sessions and list only its selected subscriptions. It cannot read events or call ordinary relay APIs:
+
+```bash
+export BUGLER_PLATFORM_TOKEN='bgl_plt_replace_me'
+export BUGLER_DAEMON_TOKEN="$(
+  curl -fsS https://app.bugler.dev/api/daemon-credentials \
+    -H "Authorization: Bearer $BUGLER_PLATFORM_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"subscription_ids":["github-starter"]}' | jq -r .token
+)"
+
+bun run bugler daemon init \
+  --account work \
+  --origin https://relay.bugler.dev \
+  --tenant tenant_123 \
+  --principal user_123 \
+  --credential-env BUGLER_DAEMON_TOKEN
+
+bun run bugler daemon start --account work
+```
+
+In another shell, register the hosted mirror and create a local consumer. Consumer creation reveals one scoped local token:
+
+```bash
+export BUGLER_HOSTED_SUB_TOKEN='bgl_sub_replace_me'
+bun run bugler local mirror add --account work --sub github-starter \
+  --token-env BUGLER_HOSTED_SUB_TOKEN
+bun run bugler local consumer create --account work --id codex --mirror github-starter
+export BUGLER_LOCAL_TOKEN='bgl_lcon_replace_me'
+bun run bugler local events --account work --consumer codex --wait 45s
+```
+
+The daemon acknowledges upstream only after the full frame and local consumer mappings commit durably. The hosted credential is imported from the named environment variable into a mode-0600 account file, then removed from the daemon process environment. Local management and consume capabilities are separate. The Unix socket and every account path are derived from the complete account tuple, so multiple daemons coexist safely.
+
+A plain self-hosted relay uses the same daemon without hosted credentials. Initialize and start it in one shell:
+
+```bash
+bun run bugler daemon init --account local --origin http://127.0.0.1:8787 \
+  --tenant default --principal operator
+bun run bugler daemon start --account local
+```
+
+In another shell, give each mirror its ordinary subscriber token by environment-variable name:
+
+```bash
+export BUGLER_SUB_TOKEN='bgl_sub_replace_me'
+bun run bugler local mirror add --account local --sub pr-agent \
+  --token-env BUGLER_SUB_TOKEN
+```
+
+This mode long-polls the OSS relay within its admitted wait and retry hints. Hosted accounts prefer the `bugler.v1` WebSocket and use the same per-subscription long-poll path after repeated socket failures. Every mirror therefore requires its subscriber token at registration, including hosted mirrors. Bugler stores each token in a private mode-0600 account file. `daemon status --json` reports `fallback_unavailable` plus the exact mirrors missing tokens instead of silently retrying.
+
+Local actions are JSON files copied into the daemon-owned account configuration directory only. Project checkouts are never searched. Install an action with the local management capability, then inspect or replay failures:
+
+```bash
+bun run bugler local actions install ./wake-codex.json --account work
+bun run bugler local actions list --account work
+bun run bugler local dead-letter list --account work
+bun run bugler local dead-letter replay --account work --id dlq_id
+```
+
+Actions receive the local CloudEvent as JSON on stdin, or through a private temporary file when large, plus scoped `BUGLER_*` metadata. They run without a shell and with a clean environment. They still have the daemon user's filesystem and network authority unless the Linux action explicitly requires an available sandbox. Execution is at least once; use `BUGLER_DELIVERY_ID` as the idempotency key.
+
+The local MCP adapter exposes the same two bounded tools over the daemon consumer socket:
+
+```bash
+export BUGLER_LOCAL_TOKEN='bgl_lcon_replace_me'
+bun run bugler mcp --account work --consumer codex
+```
+
+Total local database loss can rebuild mirror positions from hosted truth, but cannot recover locally acknowledged payloads, consumer tokens, attempts, or dead letters:
+
+```bash
+bun run bugler daemon recover --account work --from-hosted
+```
+
+Verified daily backups rotate beside the database. Restoring one requires an explicit confirmation flag and preserves the suspect database:
+
+```bash
+bun run bugler daemon recover --account work \
+  --from-backup /path/to/daemon.db.backup-1 --yes
+```
 
 ## Beyond GitHub
 

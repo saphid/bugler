@@ -53,11 +53,23 @@ describe("public repository export", () => {
       expect(await Bun.file(join(destination, "design/_body.html")).exists()).toBe(false);
       const log = Bun.spawnSync(["git", "log", "--format=%s"], { cwd: destination });
       expect(log.stdout.toString().trim()).toBe("Bugler v0.1.0");
-      expect((await readFile(join(destination, "package.json"), "utf8"))).toContain('"name": "bugler"');
+      const exportedPackage = JSON.parse(await readFile(join(destination, "package.json"), "utf8")) as {
+        name: string;
+        scripts: Record<string, string>;
+        dependencies: Record<string, string>;
+        devDependencies: Record<string, string>;
+      };
+      expect(exportedPackage.name).toBe("bugler");
+      expect(exportedPackage.dependencies).not.toHaveProperty("@clerk/backend");
+      expect(exportedPackage.devDependencies).not.toHaveProperty("jose");
+      expect(exportedPackage.scripts).not.toHaveProperty("test:platform");
+      expect(exportedPackage.scripts.test).not.toContain("test:platform");
+      const frozen = Bun.spawnSync([process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"], { cwd: destination });
+      expect(frozen.exitCode, `${frozen.stdout}\n${frozen.stderr}`).toBe(0);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("excludes the closed hosted platform tree", async () => {
     const root = join(import.meta.dir, "..");
@@ -86,7 +98,7 @@ describe("public repository export", () => {
 
       const child = Bun.spawn(["bash", "scripts/export-public.sh"], {
         cwd: clone,
-        env: { ...process.env, BUGLER_EXPORT_DIR: destination },
+        env: { ...process.env, BUGLER_EXPORT_DIR: destination, BUGLER_EXPORT_SKIP_FROZEN_CHECK: "1" },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -96,6 +108,54 @@ describe("public repository export", () => {
       ]);
       expect(exitCode, stderr).toBe(0);
       expect(await Bun.file(join(destination, "platform", "private.txt")).exists()).toBe(false);
+      expect(await Bun.file(join(destination, "deploy", "README.md")).exists()).toBe(false);
+      expect(await readFile(join(destination, "wrangler.toml"), "utf8")).not.toContain(["platform", "wrangler.toml"].join("/"));
+      expect(await readFile(join(destination, "wrangler.toml"), "utf8")).not.toContain(["BUGLER", "EXPECTED", "HOSTS"].join("_"));
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an exported source import missing from the public manifest", async () => {
+    const root = join(import.meta.dir, "..");
+    const parent = await mkdtemp(join(tmpdir(), "bugler-public-dependency-test-"));
+    const clone = join(parent, "source");
+    const destination = join(parent, "bugler-public-output");
+    try {
+      const cloned = Bun.spawnSync(["git", "clone", "--quiet", "--local", "--no-hardlinks", root, clone]);
+      expect(cloned.exitCode, cloned.stderr.toString()).toBe(0);
+      await copyFile(join(root, "scripts/export-public.sh"), join(clone, "scripts/export-public.sh"));
+      const plantedImport = ["import", '"hosted-only-probe";'].join(" ") + "\n";
+      await writeFile(join(clone, "src", "undeclared-dependency-probe.ts"), plantedImport);
+      const staged = Bun.spawnSync(["git", "add", "scripts/export-public.sh", "src/undeclared-dependency-probe.ts"], { cwd: clone });
+      expect(staged.exitCode, staged.stderr.toString()).toBe(0);
+      const committed = Bun.spawnSync(["git", "commit", "-q", "-m", "plant dependency probe"], {
+        cwd: clone,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Probe",
+          GIT_AUTHOR_EMAIL: "probe@example.invalid",
+          GIT_COMMITTER_NAME: "Probe",
+          GIT_COMMITTER_EMAIL: "probe@example.invalid",
+        },
+      });
+      expect(committed.exitCode, committed.stderr.toString()).toBe(0);
+
+      const child = Bun.spawn(["bash", "scripts/export-public.sh"], {
+        cwd: clone,
+        env: { ...process.env, BUGLER_EXPORT_DIR: destination, BUGLER_EXPORT_SKIP_FROZEN_CHECK: "1" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect(exitCode).not.toBe(0);
+      expect(`${stdout}\n${stderr}`).toContain("hosted-only-probe");
+      expect(`${stdout}\n${stderr}`).toContain("undeclared-dependency-probe.ts");
+      expect(`${stdout}\n${stderr}`).toContain("dependency absent from package.json");
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -138,7 +198,7 @@ describe("public repository export", () => {
 
         const child = Bun.spawn(["bash", "scripts/export-public.sh"], {
           cwd: clone,
-          env: { ...process.env, BUGLER_EXPORT_DIR: destination },
+          env: { ...process.env, BUGLER_EXPORT_DIR: destination, BUGLER_EXPORT_SKIP_FROZEN_CHECK: "1" },
           stdout: "pipe",
           stderr: "pipe",
         });

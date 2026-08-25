@@ -333,6 +333,15 @@ export class FirestoreStorageDriver implements StorageDriver {
   deleteSource(id: string): Promise<boolean> { return this.deleteValue("sources", id); }
 
   putSubscription(subscription: Subscription): Promise<void> { return this.putValue("subscriptions", subscription.id, subscription); }
+  async createSubscription(subscription: Subscription): Promise<boolean> {
+    try {
+      await this.valueRef("subscriptions", subscription.id).create(valueDocument(subscription));
+      return true;
+    } catch (error) {
+      if (firestoreCode(error) === 6 || firestoreCode(error) === "ALREADY_EXISTS") return false;
+      throw error;
+    }
+  }
   getSubscription(id: string): Promise<Subscription | undefined> { return this.getValue("subscriptions", id); }
   async listSubscriptions(): Promise<Subscription[]> { return (await this.listValues<Subscription>("subscriptions")).sort((left, right) => left.id.localeCompare(right.id)); }
   deleteSubscription(id: string): Promise<boolean> { return this.deleteValue("subscriptions", id); }

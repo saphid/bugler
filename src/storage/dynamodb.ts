@@ -463,6 +463,26 @@ export class DynamoDbStorageDriver implements StorageDriver {
       ...(subscription.push.leaseExpiresAt !== undefined ? { pushLeaseExpiresAt: subscription.push.leaseExpiresAt } : {}),
     });
   }
+  async createSubscription(subscription: Subscription): Promise<boolean> {
+    try {
+      await this.client.send(new PutCommand({
+        TableName: this.tableName,
+        Item: {
+          ...recordItem("SUB", subscription.id, subscription),
+          cursor: subscription.cursor,
+          cursorEpoch: subscription.cursorEpoch,
+          ...(subscription.lastSeenAt !== undefined ? { lastSeenAt: subscription.lastSeenAt } : {}),
+          ...(subscription.push.leaseToken !== undefined ? { pushLeaseToken: subscription.push.leaseToken } : {}),
+          ...(subscription.push.leaseExpiresAt !== undefined ? { pushLeaseExpiresAt: subscription.push.leaseExpiresAt } : {}),
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }));
+      return true;
+    } catch (error) {
+      if (conditionalFailure(error)) return false;
+      throw error;
+    }
+  }
   updateSubscription(subscription: Subscription): Promise<void> { return this.putSubscription(subscription); }
   async getSubscription(id: string): Promise<Subscription | undefined> { return itemValue<Subscription>(await this.getItem("SUB", id)); }
   async listSubscriptions(): Promise<Subscription[]> { return (await this.listValues<Subscription>("SUB")).sort((a, b) => a.id.localeCompare(b.id)); }

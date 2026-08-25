@@ -24,6 +24,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run test:core
+      - name: Daemon MCP conformance
+        run: bun run test:daemon-mcp
       - run: bun run test:workers
       - run: bash scripts/smoke.sh
 

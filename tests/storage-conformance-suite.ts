@@ -51,9 +51,19 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonical(item)]));
+  }
+  return value;
+}
+
 function equal(actual: unknown, expected: unknown, message: string): void {
-  const left = JSON.stringify(actual);
-  const right = JSON.stringify(expected);
+  const left = JSON.stringify(canonical(actual));
+  const right = JSON.stringify(canonical(expected));
   if (left !== right) throw new Error(`${message}: expected ${right}, received ${left}`);
 }
 
@@ -78,6 +88,31 @@ const noSecrets: SecretResolver = {
 };
 
 export const storageConformanceCases: Array<{ name: string; run: (factory: StorageFactory) => Promise<void> }> = [
+  {
+    name: "creates subscriptions atomically without replacing an existing id",
+    async run(factory) {
+      const driver = await factory();
+      try {
+        const contenders = Array.from({ length: 8 }, (_, index) => ({
+          ...conformanceSubscription("create-only"),
+          tokenHash: `hash-${index}`,
+          tokenPrefix: `bgl_sub_${index}`,
+          cursor: index,
+          cursorEpoch: index,
+        }));
+        const results = await Promise.all(contenders.map((subscription) => driver.createSubscription(subscription)));
+        equal(results.filter(Boolean).length, 1, "exactly one concurrent create must insert");
+        const winner = contenders[results.findIndex(Boolean)]!;
+        equal(await driver.getSubscription("create-only"), winner, "the inserted subscription must be the durable winner");
+
+        const replacement = { ...conformanceSubscription("create-only"), tokenHash: "takeover", cursor: 0, cursorEpoch: 0 };
+        equal(await driver.createSubscription(replacement), false, "an existing id must reject create");
+        equal(await driver.getSubscription("create-only"), winner, "a rejected create must not mutate any existing field");
+      } finally {
+        await driver.close();
+      }
+    },
+  },
   {
     name: "allocates monotonic sequences and returns the existing deduplicated row",
     async run(factory) {

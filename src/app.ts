@@ -7,8 +7,9 @@ import {
   bearerToken,
   mintToken,
 } from "./auth";
-import { BINARY_DELIVERY_PROFILE, DeliveryCoordinator, DeliveryError, type DeliveryProfile } from "./delivery";
+import { BINARY_DELIVERY_PROFILE, DeliveryCoordinator, DeliveryError, type DeliveryProfile, type EventEntitlement } from "./delivery";
 import type {
+  AdminKey,
   EventQuery,
   Filter,
   MappingConfig,
@@ -42,10 +43,17 @@ export interface CreateAppOptions {
   health?: RelayHealth;
   pushEngine?: PushEngine;
   sseMaxLifetimeMs?: number;
+  sseRecheckMs?: number;
   onEventsDelivered?: (subscriptionId: string, seqs: number[], at: string) => Promise<void>;
   onSubscriberAuthChanged?: (subscription: Subscription) => Promise<void>;
   onSubscriberDeleted?: (subscriptionId: string) => Promise<void>;
+  onSourceChanged?: (source: Source) => Promise<void>;
+  onSourceDeleted?: (sourceId: string) => Promise<void>;
+  onAdminAuthChanged?: (key: AdminKey) => Promise<void>;
+  onAdminDeleted?: (keyId: string) => Promise<void>;
   onEventCommitted?: (sourceId: string, seq: number) => Promise<void>;
+  subscriberStreamAllowed?: (subscriptionId: string, admissionId?: string) => Promise<boolean>;
+  eventEntitlement?: (request: Request, subscription?: Subscription) => Promise<EventEntitlement>;
 }
 
 function publicSubscription(subscription: Subscription): Omit<Subscription, "tokenHash" | "oldTokenHash"> {
@@ -162,6 +170,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
   const pushEngine = options.pushEngine ?? new PushEngine(driver, secrets, { now });
   const bodyCap = Math.min(options.maxPayloadBytes ?? 5 * 1024 * 1024, driver.capabilities.maxPayloadBytes ?? Number.POSITIVE_INFINITY);
   const sseMaxLifetimeMs = options.sseMaxLifetimeMs ?? 5 * 60 * 1000;
+  const sseRecheckMs = options.sseRecheckMs ?? 15_000;
   const app = new Hono();
 
   app.use("*", async (context, next) => {
@@ -273,6 +282,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
       };
       if (source.kind === "poll" && !source.poll) throw new Error("poll source requires poll config");
       await driver.putSource(source);
+      if (options.onSourceChanged) await options.onSourceChanged(source);
       return context.json({ source }, 201);
     } catch (error) {
       return context.json({ error: asErrorMessage(error) }, 422);
@@ -308,6 +318,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
       if (source.reconcile?.credential_ref) references.push(source.reconcile.credential_ref);
       await validateSecretReferences(secrets, references);
       await driver.putSource(source);
+      if (options.onSourceChanged) await options.onSourceChanged(source);
       return context.json({ source });
     } catch (error) {
       return context.json({ error: asErrorMessage(error) }, 422);
@@ -315,7 +326,10 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
   });
   app.delete("/sources/:id", async (context) => {
     if (!(await requireAdmin(context))) return context.json({ error: "unauthorized" }, 401);
-    return (await driver.deleteSource(context.req.param("id"))) ? context.body(null, 204) : context.json({ error: "not found" }, 404);
+    const id = context.req.param("id");
+    if (!(await driver.deleteSource(id))) return context.json({ error: "not found" }, 404);
+    if (options.onSourceDeleted) await options.onSourceDeleted(id);
+    return context.body(null, 204);
   });
 
   app.post("/subscriptions", async (context) => {
@@ -341,7 +355,9 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
         createdAt: now().toISOString(),
         lastSeenAt: now().toISOString(),
       };
-      await driver.putSubscription(subscription);
+      if (!(await driver.createSubscription(subscription))) {
+        return context.json({ error: "subscription id already exists" }, 409);
+      }
       if (options.onSubscriberAuthChanged) await options.onSubscriberAuthChanged(subscription);
       return context.json({ subscription: publicSubscription(subscription), token: minted.token }, 201);
     } catch (error) {
@@ -427,6 +443,8 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
   app.post("/subscriptions/:id/events", async (context) => {
     const token = bearerToken(context.req.header("authorization"));
     if (!(await authenticateSubscriber(driver, context.req.param("id"), token, now()))) return context.json({ error: "unauthorized" }, 401);
+    const subscription = await driver.getSubscription(context.req.param("id"));
+    const entitlement = options.eventEntitlement ? await options.eventEntitlement(context.req.raw, subscription) : "allow";
     const raw = await context.req.json().catch(() => ({}));
     const body = isRecord(raw) ? raw : {};
     const wait = body.wait === undefined ? undefined : parseDurationSeconds(body.wait);
@@ -438,7 +456,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
       ...(ack !== undefined ? { ack } : {}),
       ...(ackEpoch !== undefined ? { ack_epoch: ackEpoch } : {}),
       ...(limit !== undefined ? { limit } : {}),
-    });
+    }, entitlement);
     if ("events" in payload && payload.events.length > 0 && options.onEventsDelivered) {
       await options.onEventsDelivered(context.req.param("id"), payload.events.map((event) => event.seq), now().toISOString());
     }
@@ -454,13 +472,21 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     return streamSSE(context, async (stream) => {
       const abort = new AbortController();
       stream.onAbort(() => abort.abort());
-      const expiresAt = Date.now() + sseMaxLifetimeMs;
+      const requestedLifetime = Number(context.req.header("x-bugler-stream-lifetime-ms"));
+      const streamLifetime = Number.isFinite(requestedLifetime) && requestedLifetime > 0
+        ? Math.min(sseMaxLifetimeMs, requestedLifetime)
+        : sseMaxLifetimeMs;
+      const expiresAt = Date.now() + streamLifetime;
       let gapSentTo: number | undefined;
       let cursorEpoch: number | undefined;
+      const admissionId = context.req.header("x-bugler-stream-admission-id");
       while (!abort.signal.aborted && Date.now() < expiresAt) {
+        if (options.subscriberStreamAllowed && !(await options.subscriberStreamAllowed(id, admissionId))) break;
         if (!(await authenticateSubscriber(driver, id, token, now()))) break;
         const observedGeneration = delivery.currentSignalGeneration();
-        const payload = await delivery.readForSse(id, afterSeq);
+        const subscription = await driver.getSubscription(id);
+        const entitlement = options.eventEntitlement ? await options.eventEntitlement(context.req.raw, subscription) : "allow";
+        const payload = await delivery.readForSse(id, afterSeq, 100, entitlement);
         if (cursorEpoch !== undefined && payload.cursor_epoch !== cursorEpoch) {
           afterSeq = undefined;
           gapSentTo = undefined;
@@ -484,7 +510,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
         }
         const remaining = expiresAt - Date.now();
         if (remaining <= 0) break;
-        const reason = await delivery.waitForSignal(observedGeneration, Math.min(15_000, remaining), abort.signal);
+        const reason = await delivery.waitForSignal(observedGeneration, Math.min(sseRecheckMs, remaining), abort.signal);
         if (reason === "aborted") break;
         if (reason === "timeout") await stream.write(": keepalive\n\n");
       }
@@ -560,7 +586,8 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
         ...(eventSince ? { eventSince } : {}),
         ...(eventUntil ? { eventUntil } : {}),
       };
-      return context.json(await queryHistory(driver, query, subscriberFilter));
+      const entitlement = options.eventEntitlement ? await options.eventEntitlement(context.req.raw) : "allow";
+      return context.json(await queryHistory(driver, query, subscriberFilter, entitlement));
     } catch (error) {
       return context.json({ error: asErrorMessage(error) }, 422);
     }
@@ -580,6 +607,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
       ...(typeof body.expires_at === "string" ? { expiresAt: body.expires_at } : {}),
     };
     await driver.putAdminKey(key);
+    if (options.onAdminAuthChanged) await options.onAdminAuthChanged(key);
     return context.json({ admin_key: publicAdminKey(key), token: minted.token }, 201);
   });
   app.patch("/admin-keys/:id", async (context) => {
@@ -591,6 +619,7 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     else if (typeof body.expires_at === "string" && Number.isFinite(Date.parse(body.expires_at))) key.expiresAt = body.expires_at;
     else return context.json({ error: "expires_at must be an ISO timestamp or null" }, 422);
     await driver.putAdminKey(key);
+    if (options.onAdminAuthChanged) await options.onAdminAuthChanged(key);
     return context.json({ admin_key: publicAdminKey(key) });
   });
   app.delete("/admin-keys/:id", async (context) => {
@@ -599,7 +628,10 @@ export function createApp(options: CreateAppOptions): { app: Hono; delivery: Del
     if (admin.id === context.req.param("id") && (await driver.listAdminKeys()).filter((key) => !key.expiresAt || Date.parse(key.expiresAt) > now().getTime()).length === 1) {
       return context.json({ error: "cannot revoke the last active admin key" }, 409);
     }
-    return (await driver.deleteAdminKey(context.req.param("id"))) ? context.body(null, 204) : context.json({ error: "not found" }, 404);
+    const id = context.req.param("id");
+    if (!(await driver.deleteAdminKey(id))) return context.json({ error: "not found" }, 404);
+    if (options.onAdminDeleted) await options.onAdminDeleted(id);
+    return context.body(null, 204);
   });
 
   return { app, delivery, health };

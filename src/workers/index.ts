@@ -61,7 +61,7 @@ export class BuglerDurableObject extends DurableObject<WorkersEnv> {
 
   private async ensureBootstrapAdmin(value: unknown): Promise<void> {
     if (typeof value !== "string" || !value) return;
-    if (!hasValidTokenChecksum(value, "adm")) throw new Error("BUGLER_BOOTSTRAP_ADMIN_TOKEN is not a valid Bugler admin token");
+    if (!hasValidTokenChecksum(value, "adm")) throw new Error("BUGLER_BOOTSTRAP_ADMIN_TOKEN must be a checksummed bgl_adm_ token; mint one with the documented bun mintToken command");
     const keyHash = hashToken(value);
     const current = (await this.driver.listAdminKeys()).find((key) => key.id === "workers-bootstrap");
     if (current?.keyHash === keyHash) return;

@@ -430,6 +430,15 @@ export class CosmosStorageDriver implements StorageDriver {
   deleteSource(id: string): Promise<boolean> { return this.deleteValue("source", id); }
 
   putSubscription(subscription: Subscription): Promise<void> { return this.putValue("subscription", subscription.id, subscription); }
+  async createSubscription(subscription: Subscription): Promise<boolean> {
+    try {
+      await this.container.items.create(valueRecord("subscription", subscription.id, subscription));
+      return true;
+    } catch (error) {
+      if (statusOf(error) === 409) return false;
+      throw error;
+    }
+  }
   updateSubscription(subscription: Subscription): Promise<void> { return this.putSubscription(subscription); }
   async getSubscription(id: string): Promise<Subscription | undefined> { return recordValue<Subscription>(await this.read("subscription", id)); }
   async listSubscriptions(): Promise<Subscription[]> { return (await this.listValues<Subscription>("subscription")).sort((a, b) => a.id.localeCompare(b.id)); }

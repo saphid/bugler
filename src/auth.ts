@@ -5,6 +5,7 @@ import type { StorageDriver } from "./storage/driver";
 import { newUlid } from "./util";
 
 type TokenKind = "adm" | "sub";
+export type LocalTokenKind = "lmg" | "lcon" | "lact";
 
 function crc32(input: string): string {
   let crc = 0xffffffff;
@@ -19,6 +20,23 @@ export function mintToken(kind: TokenKind): { token: string; hash: string; prefi
   const body = `bgl_${kind}_${Buffer.from(randomBytes(24)).toString("base64url")}`;
   const token = `${body}_${crc32(body)}`;
   return { token, hash: hashToken(token), prefix: token.slice(0, 18) };
+}
+
+export function mintLocalToken(kind: LocalTokenKind): { token: string; hash: string; prefix: string } {
+  const body = `bgl_${kind}_${Buffer.from(randomBytes(24)).toString("base64url")}`;
+  const token = `${body}_${crc32(body)}`;
+  return { token, hash: hashToken(token), prefix: token.slice(0, 18) };
+}
+
+export function hasValidLocalTokenChecksum(token: string, kind: LocalTokenKind): boolean {
+  if (!token.startsWith(`bgl_${kind}_`)) return false;
+  const split = token.lastIndexOf("_");
+  if (split < 8) return false;
+  const body = token.slice(0, split);
+  const actual = token.slice(split + 1);
+  const expected = crc32(body);
+  if (actual.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
 
 export function hasValidTokenChecksum(token: string, kind?: TokenKind): boolean {

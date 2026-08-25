@@ -3,8 +3,9 @@ import { describe, expect, it } from "bun:test";
 import { authenticateAdmin, hasValidTokenChecksum, makeAdminKey, mintToken } from "../src/auth";
 import { createProductEnvironmentReader } from "../src/environment";
 import type { Source, Subscription } from "../src/domain";
-import { DeliveryCoordinator, DeliveryError } from "../src/delivery";
+import { BINARY_DELIVERY_PROFILE, DeliveryCoordinator, DeliveryError } from "../src/delivery";
 import { matchesFilter, validateFilter } from "../src/filter";
+import { queryHistory } from "../src/history";
 import { mapEnvelope } from "../src/mapping";
 import { PollEngine } from "../src/poll";
 import { buildPushRequest, PushEngine } from "../src/push";
@@ -12,6 +13,7 @@ import { GitHubReconciler } from "../src/reconcile";
 import { RelayRuntime } from "../src/runtime";
 import { EnvironmentFileSecretResolver } from "../src/secrets";
 import { MemoryStorageDriver } from "../src/storage/memory";
+import type { StorageDriver } from "../src/storage/driver";
 import { verifyRequest } from "../src/verification";
 
 class CountingMemoryStorageDriver extends MemoryStorageDriver {
@@ -214,15 +216,29 @@ describe("delivery", () => {
       maxBatch: 10,
       scanLimit: 100,
     }, () => clock);
-    const first = await delivery.poll(subscription.id, { wait: 0 });
-    const second = await delivery.poll(subscription.id, { wait: 0 });
+    const first = await delivery.poll(subscription.id, { wait: 0 }, "allow");
+    const second = await delivery.poll(subscription.id, { wait: 0 }, "allow");
     expect("events" in first ? first.events : []).toEqual([stored.event]);
     expect("events" in second ? second.events : []).toEqual([stored.event]);
     await driver.rewindCursor(subscription.id, 0);
-    await expect(delivery.poll(subscription.id, { wait: 0, ack: stored.event.seq, ack_epoch: 0 })).rejects.toMatchObject({ code: "stale_epoch" });
+    await expect(delivery.poll(subscription.id, { wait: 0, ack: stored.event.seq, ack_epoch: 0 }, "allow")).rejects.toMatchObject({ code: "stale_epoch" });
     clock = new Date("2026-08-23T00:01:01Z");
-    const acked = await delivery.poll(subscription.id, { wait: 0, ack: stored.event.seq, ack_epoch: 1 });
+    const acked = await delivery.poll(subscription.id, { wait: 0, ack: stored.event.seq, ack_epoch: 1 }, "allow");
     expect("events" in acked && acked.events).toEqual([]);
+  });
+
+  it("denies direct read-seam calls unless access is explicitly allowed", async () => {
+    const driver = new MemoryStorageDriver();
+    const subscription = testSubscription("fail-closed");
+    await driver.putSubscription(subscription);
+    await driver.appendEvent(githubEvent());
+    const delivery = new DeliveryCoordinator(driver, { ...BINARY_DELIVERY_PROFILE, minWaitSeconds: 0 });
+    const omitted = await delivery.poll(subscription.id, { wait: 0 });
+    const denied = await delivery.poll(subscription.id, { wait: 0 }, "deny");
+    const allowed = await delivery.poll(subscription.id, { wait: 0 }, "allow");
+    expect("events" in omitted ? omitted.events : []).toEqual([]);
+    expect("events" in denied ? denied.events : []).toEqual([]);
+    expect("events" in allowed ? allowed.events : []).toHaveLength(1);
   });
 
   it("returns one retry hint, then rate limits empty spinning", async () => {
@@ -249,6 +265,31 @@ describe("delivery", () => {
     const second = delivery.poll("sub-1", { wait: 0 });
     expect(await first).toMatchObject({ events: [], superseded: true });
     expect(await second).toMatchObject({ events: [], retry_after: 60 });
+  });
+});
+
+describe("history", () => {
+  it("returns a continuation cursor when sparse entitlement scanning reaches its bound", async () => {
+    const base = githubEvent();
+    const driver = {
+      queryEvents: async (query: { sinceSeq?: number; limit: number }) => {
+        const start = (query.sinceSeq ?? 0) + 1;
+        const end = Math.min(100_001, start + query.limit - 1);
+        return Array.from({ length: Math.max(0, end - start + 1) }, (_, offset) => ({
+          ...base,
+          seq: start + offset,
+          id: `history-${start + offset}`,
+          dedupekey: `history-${start + offset}`,
+          source: start + offset === 100_001 ? "github/acme/visible" : "github/acme/hidden",
+        }));
+      },
+      oldestAvailableSeq: async () => 1,
+    } as unknown as StorageDriver;
+    const entitlement = { exact: { source: "github/acme/visible" } } as const;
+    const first = await queryHistory(driver, { limit: 1 }, undefined, entitlement);
+    expect(first).toEqual({ events: [], next_since_seq: 100_000, oldest_available_seq: 1 });
+    const second = await queryHistory(driver, { limit: 1, sinceSeq: first.next_since_seq! }, undefined, entitlement);
+    expect(second.events.map((event) => event.seq)).toEqual([100_001]);
   });
 });
 
@@ -439,6 +480,43 @@ describe("signed push", () => {
     gapParked.push = { failureCount: 0, parked: 2, gapTo: 12 };
     await driver.updateSubscription(gapParked);
     expect((await engine.unpark("push"))?.push).toEqual({ failureCount: 0, parked: 2, gapTo: 12 });
+    delete process.env.TEST_WHSEC;
+  });
+
+  it("intersects hosted entitlement before composing a push request", async () => {
+    process.env.TEST_WHSEC = "push-secret";
+    const driver = new MemoryStorageDriver();
+    const subscription = testSubscription("push-entitled", { type: "push", url: "https://example.test/hook", whsec_refs: ["env:TEST_WHSEC"] });
+    subscription.filter = { prefix: { source: "github/" } };
+    await driver.putSubscription(subscription);
+    await driver.appendEvent({ ...githubEvent("event-hidden"), dedupekey: "hidden", source: "github/acme/hidden" });
+    await driver.appendEvent({ ...githubEvent("event-visible"), dedupekey: "visible", source: "github/acme/visible" });
+    let delivered: { source?: string } | undefined;
+    const engine = new PushEngine(driver, new EnvironmentFileSecretResolver(), {
+      eventEntitlement: async () => ({ exact: { source: "github/acme/visible" } }),
+      fetch: async (_input, init) => { delivered = JSON.parse(String(init?.body)) as { source?: string }; return new Response("", { status: 204 }); },
+    });
+    expect((await engine.attempt(subscription.id)).status).toBe("success");
+    expect(delivered).toMatchObject({ source: "github/acme/visible" });
+    expect((await driver.getSubscription(subscription.id))?.cursor).toBe(2);
+    delete process.env.TEST_WHSEC;
+  });
+
+  it("does not compose push delivery when the entitlement seam denies", async () => {
+    process.env.TEST_WHSEC = "push-secret";
+    const driver = new MemoryStorageDriver();
+    const subscription = testSubscription("push-denied", { type: "push", url: "https://example.test/hook", whsec_refs: ["env:TEST_WHSEC"] });
+    await driver.putSubscription(subscription);
+    await driver.appendEvent(githubEvent());
+    let fetches = 0;
+    const engine = new PushEngine(driver, new EnvironmentFileSecretResolver(), {
+      eventEntitlement: async () => "deny",
+      fetch: async () => { fetches += 1; return new Response("", { status: 204 }); },
+    });
+    expect((await engine.attempt(subscription.id)).status).toBe("empty");
+    expect(fetches).toBe(0);
+    expect(await driver.getSubscription(subscription.id)).toMatchObject({ cursor: 0, push: { failureCount: 0, parked: 0 } });
+    expect((await driver.getSubscription(subscription.id))?.push.scannedThroughSeq).toBeUndefined();
     delete process.env.TEST_WHSEC;
   });
 

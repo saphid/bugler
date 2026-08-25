@@ -25,6 +25,7 @@ export interface WorkersSchedulerOptions {
   onEvent?: () => void;
   pushFetch?: PushEngineOptions["fetch"];
   onPushDelivered?: PushEngineOptions["onDelivered"];
+  pushEventEntitlement?: PushEngineOptions["eventEntitlement"];
   retentionPolicy?: () => Promise<{ maxAgeMs?: number; maxCount?: number; maxBytes?: number; pinningWindowMs?: number }>;
 }
 
@@ -97,6 +98,7 @@ export class WorkersDueWorkScheduler {
       now: this.now,
       ...(options.pushFetch ? { fetch: options.pushFetch } : {}),
       ...(options.onPushDelivered ? { onDelivered: options.onPushDelivered } : {}),
+      ...(options.pushEventEntitlement ? { eventEntitlement: options.pushEventEntitlement } : {}),
     });
     this.reconcile = new GitHubReconciler(driver, secrets, fetch, this.now);
   }

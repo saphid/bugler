@@ -279,6 +279,24 @@ export class DurableObjectStorageDriver implements StorageDriver {
   }
 
   async putSubscription(subscription: Subscription): Promise<void> { this.writeSubscription(subscription); }
+  async createSubscription(subscription: Subscription): Promise<boolean> {
+    return this.sql.exec(
+      `INSERT INTO subscriptions
+       (id, value, token_hash, token_prefix, old_token_hash, old_token_expires_at, cursor, cursor_epoch, last_seen_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO NOTHING`,
+      subscription.id,
+      JSON.stringify(subscription),
+      subscription.tokenHash,
+      subscription.tokenPrefix,
+      subscription.oldTokenHash ?? null,
+      subscription.oldTokenExpiresAt ?? null,
+      subscription.cursor,
+      subscription.cursorEpoch,
+      subscription.lastSeenAt ?? null,
+      subscription.createdAt,
+    ).rowsWritten > 0;
+  }
   async updateSubscription(subscription: Subscription): Promise<void> { this.writeSubscription(subscription); }
 
   async getSubscription(id: string): Promise<Subscription | undefined> {

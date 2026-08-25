@@ -1,5 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import type { StoredEvent, Subscription, Transport } from "./domain";
+import type { EventEntitlement } from "./delivery";
 import { matchesFilter } from "./filter";
 import type { SecretResolver } from "./secrets";
 import type { StorageDriver } from "./storage/driver";
@@ -91,6 +92,7 @@ export interface PushEngineOptions {
   timeoutMs?: number;
   leaseMs?: number;
   onDelivered?: (subscriptionId: string, seq: number, at: string) => Promise<void>;
+  eventEntitlement?: (subscription: Subscription) => Promise<EventEntitlement>;
 }
 
 export class PushEngine {
@@ -99,6 +101,7 @@ export class PushEngine {
   private readonly timeoutMs: number;
   private readonly leaseMs: number;
   private readonly onDelivered: PushEngineOptions["onDelivered"];
+  private readonly eventEntitlement: PushEngineOptions["eventEntitlement"];
 
   constructor(
     private readonly driver: StorageDriver,
@@ -110,6 +113,7 @@ export class PushEngine {
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.leaseMs = options.leaseMs ?? 60_000;
     this.onDelivered = options.onDelivered;
+    this.eventEntitlement = options.eventEntitlement;
   }
 
   private clearLease(subscription: Subscription): void {
@@ -144,12 +148,24 @@ export class PushEngine {
       id = `gap:${subscription.id}:${gapTo}`;
     } else {
       let event: StoredEvent | undefined;
+      const entitlement = this.eventEntitlement ? await this.eventEntitlement(subscription) : "allow";
+      if (entitlement === "deny") {
+        this.clearLease(subscription);
+        const committed = await this.driver.commitPushMutation({
+          subscriptionId,
+          expectedLeaseToken: leaseToken,
+          expectedCursorEpoch: subscription.cursorEpoch,
+          push: subscription.push,
+        });
+        return { status: committed.status === "committed" ? "empty" : "busy" };
+      }
       let scanCursor = subscription.cursor;
       let fullyScanned = false;
       const newestAtScan = await this.driver.newestSeq();
       for (let page = 0; page < 100 && !event; page += 1) {
         const rows = await this.driver.queryEvents({ sinceSeq: scanCursor, untilSeq: newestAtScan, limit: 1_000 });
-        event = rows.find((row) => matchesFilter(row, subscription.filter));
+        event = rows.find((row) => matchesFilter(row, subscription.filter)
+          && (entitlement === "allow" || matchesFilter(row, entitlement)));
         if (event) break;
         if (rows.length < 1_000) {
           fullyScanned = true;

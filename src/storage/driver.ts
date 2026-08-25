@@ -55,6 +55,8 @@ export interface StorageDriver {
   deleteSource(id: string): Promise<boolean>;
 
   putSubscription(subscription: Subscription): Promise<void>;
+  /** Atomically inserts a subscription only when its id is absent. Existing rows are never mutated. */
+  createSubscription(subscription: Subscription): Promise<boolean>;
   getSubscription(id: string): Promise<Subscription | undefined>;
   listSubscriptions(): Promise<Subscription[]>;
   deleteSubscription(id: string): Promise<boolean>;

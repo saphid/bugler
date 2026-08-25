@@ -91,6 +91,31 @@ async function readSseUntil(
 }
 
 describe("HTTP API boundaries", () => {
+  it("keeps subscription creation create-only and preserves an existing row", async () => {
+    const { app, driver, adminHeaders } = await setup();
+    const request = (filter: unknown, action: string) => app.request("/subscriptions", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ id: "stable-subscription", filter, transport: { type: "pull" }, action }),
+    });
+    const first = await request({ exact: { source: "original/source" } }, "original action");
+    expect(first.status).toBe(201);
+    const originalToken = (await first.json() as { token: string }).token;
+    const original = await driver.getSubscription("stable-subscription");
+    expect(original).toBeDefined();
+    await driver.updateSubscription({ ...original!, cursor: 7, cursorEpoch: 3 });
+
+    const takeover = await request({ exact: { source: "attacker/source" } }, "replacement action");
+    expect(takeover.status).toBe(409);
+    expect(await takeover.json() as unknown).toEqual({ error: "subscription id already exists" });
+    expect(await driver.getSubscription("stable-subscription")).toEqual({ ...original!, cursor: 7, cursorEpoch: 3 });
+    expect((await app.request("/subscriptions/stable-subscription/events", {
+      method: "POST",
+      headers: { authorization: `Bearer ${originalToken}`, "content-type": "application/json" },
+      body: '{"wait":0}',
+    })).status).toBe(200);
+  });
+
   it("returns 422 for dangling secret references at configuration time", async () => {
     delete process.env.TEST_API_GH_SECRET;
     const { app, adminHeaders } = await setup();

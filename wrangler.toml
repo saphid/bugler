@@ -4,7 +4,7 @@ compatibility_date = "2026-08-22"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 # The OSS worker intentionally owns no bugler.dev route. Hosted custom domains
-# belong exclusively to platform/wrangler.toml so guardrails cannot be bypassed.
+# are intentionally not claimed by this self-hosted Worker.
 
 [vars]
 BUGLER_LEGACY_DO = "1"

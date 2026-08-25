@@ -15,6 +15,8 @@ import { SqliteStorageDriver } from "./storage/sqlite";
 import { DynamoDBClient, type DynamoDBClientConfig } from "@aws-sdk/client-dynamodb";
 import { newUlid, parseDurationSeconds } from "./util";
 import { productEnvironment, productEnvironmentVariable } from "./environment";
+import { daemonCli, localCli } from "./daemon/cli";
+import { loadDaemonAccount } from "./daemon/account";
 
 interface Arguments {
   positionals: string[];
@@ -109,7 +111,10 @@ Usage:
   bugler serve [--db bugler.db] [--host 127.0.0.1] [--port 8787]
   bugler listen --relay URL --sub ID [--wait 30s] [--once] -- COMMAND [ARGS]
   bugler mcp --relay URL --sub ID
+  bugler mcp --account NAME --consumer ID
   bugler poll --url URL --to INGEST_URL --token-ref env:NAME --source-id ID [options]
+  bugler daemon <init|start|status|install|recover> [options]
+  bugler local <resource> <operation> [options]
 
 Listen options:
   --token-env NAME         Read subscriber token from NAME, default BUGLER_TOKEN
@@ -154,6 +159,34 @@ async function listenCommand(args: Arguments, command: string[]): Promise<void> 
 }
 
 async function mcpCommand(args: Arguments): Promise<void> {
+  const account = stringFlag(args, "account");
+  if (account) {
+    if (args.flags.has("token")) throw new Error("daemon MCP tokens are accepted only through an environment variable");
+    const consumer = stringFlag(args, "consumer");
+    if (!consumer) throw new Error("daemon mcp requires --consumer");
+    const tokenEnvironment = stringFlag(args, "token-env", "BUGLER_LOCAL_TOKEN")!;
+    const token = process.env[tokenEnvironment];
+    if (!token) throw new Error(`daemon MCP token environment variable ${tokenEnvironment} is missing`);
+    const config = await loadDaemonAccount(account, {
+      ...(stringFlag(args, "config-root") ? { configRoot: stringFlag(args, "config-root")! } : {}),
+      ...(stringFlag(args, "state-root") ? { stateRoot: stringFlag(args, "state-root")! } : {}),
+      ...(stringFlag(args, "runtime-root") ? { runtimeRoot: stringFlag(args, "runtime-root")! } : {}),
+    });
+    const status: { port?: number } = await readFile(config.statusPath, "utf8").then((value) => JSON.parse(value) as { port?: number }).catch(() => ({}));
+    const endpoint = status.port
+      ? `http://127.0.0.1:${status.port}/v1/consumers/${encodeURIComponent(consumer)}/events`
+      : `http://localhost/v1/consumers/${encodeURIComponent(consumer)}/events`;
+    const localFetch = async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      headers.set("x-bugler-local-client", "cli");
+      if (status.port) headers.set("origin", `http://127.0.0.1:${status.port}`);
+      return status.port
+        ? fetch(input, { ...init, headers })
+        : fetch(input, { ...init, headers, unix: config.socketPath });
+    };
+    await serveMcpStdio({ eventsEndpoint: endpoint, subscriptionId: consumer, token, fetch: localFetch });
+    return;
+  }
   const relay = stringFlag(args, "relay");
   const subscriptionId = stringFlag(args, "sub");
   if (!relay || !subscriptionId) throw new Error("mcp requires --relay and --sub");
@@ -184,7 +217,7 @@ async function serveCommand(args: Arguments): Promise<void> {
   if (driver.capabilities.name !== "bun:sqlite" && (await driver.listAdminKeys()).length === 0) {
     if (!bootstrapToken || !hasValidTokenChecksum(bootstrapToken, "adm")) {
       await driver.close();
-      throw new Error("storage has no admin key; run bugler init or supply a valid BUGLER_BOOTSTRAP_ADMIN_TOKEN");
+      throw new Error("storage has no admin key; BUGLER_BOOTSTRAP_ADMIN_TOKEN must be a checksummed bgl_adm_ token. Mint one with: bun -e 'import { mintToken } from \"./src/auth\"; console.log(mintToken(\"adm\").token)'");
     }
     const now = new Date();
     await driver.putAdminKey({
@@ -318,6 +351,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (separator < 0) throw new Error("listen requires -- before the command");
     return listenCommand(parseArguments(rest.slice(0, separator)), rest.slice(separator + 1));
   }
+  if (command === "daemon") return daemonCli(rest);
+  if (command === "local") return localCli(rest);
   const args = parseArguments(rest);
   if (command === "init") return initCommand(args);
   if (command === "serve") return serveCommand(args);

@@ -129,6 +129,13 @@ export class MemoryStorageDriver implements StorageDriver {
   putSubscription(subscription: Subscription): Promise<void> {
     return this.write(() => this.subscriptions.set(subscription.id, cloneValue(subscription))).then(() => undefined);
   }
+  createSubscription(subscription: Subscription): Promise<boolean> {
+    return this.write(() => {
+      if (this.subscriptions.has(subscription.id)) return false;
+      this.subscriptions.set(subscription.id, cloneValue(subscription));
+      return true;
+    });
+  }
   async getSubscription(id: string): Promise<Subscription | undefined> {
     const value = this.subscriptions.get(id);
     return value ? cloneValue(value) : undefined;
