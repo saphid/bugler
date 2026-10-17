@@ -286,10 +286,13 @@ describe("Workers profile", () => {
   });
 
   it("keeps repeated alarm delivery idempotent", async () => {
+    // The real alarm applies default 30-day age retention against the wall
+    // clock, so stamp these events now rather than with the fixed fixture date.
+    const receivedat = new Date().toISOString();
     await withDriver(async (instance, state) => {
-      await instance.driver.appendEvent(conformanceEvent("alarm-1", "alarm-1"));
-      await instance.driver.appendEvent(conformanceEvent("alarm-2", "alarm-2"));
-      await instance.driver.appendEvent(conformanceEvent("alarm-3", "alarm-3"));
+      await instance.driver.appendEvent(conformanceEvent("alarm-1", "alarm-1", receivedat));
+      await instance.driver.appendEvent(conformanceEvent("alarm-2", "alarm-2", receivedat));
+      await instance.driver.appendEvent(conformanceEvent("alarm-3", "alarm-3", receivedat));
       await state.storage.put("bugler:scheduler:retention-due", Date.now() - 1);
       await state.storage.setAlarm(Date.now() + 60_000);
     });
